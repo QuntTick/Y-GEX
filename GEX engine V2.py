@@ -20,6 +20,7 @@ warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
 
 # --- CONFIGURATION ---
 TICKER = "^SPX"
+SPY_TICKER = "SPY"
 FUTURES_TICKER = "ES=F"
 VIX_TICKER = "^VIX"
 UDP_IP = "127.0.0.1"
@@ -49,10 +50,6 @@ def get_latest_price(symbol):
 
 # --- TRADING-TIME FRACTION CALCULATOR ---
 def calc_trading_T(exp_date, now_ny):
-    """
-    Calculates time to expiration using actual trading time fractions.
-    Corrects post-market edge cases using expiration date target close.
-    """
     total_secs = (exp_date - now_ny).total_seconds()
     if total_secs <= 0: return 1e-5
     
@@ -135,12 +132,26 @@ def fetch_chain_concurrently(ticker_obj, exp):
         return exp, None
 
 def prune_history_state():
-    """ Prunes expired options from local memory state (Claude's Fix) """
     global history_state
     today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
     stale_keys = [k for k in history_state.keys() if k.split('_')[0] < today_str]
     for k in stale_keys:
         history_state.pop(k, None)
+
+# --- SKEW / VOLATILITY SMILE SMOOTHING ---
+def smooth_volatility_smile(strikes, ivs):
+    """
+    Fits a 3rd-degree polynomial to model the mathematical volatility smile/skew.
+    Smooths out pricing inconsistencies caused by standard exchange bid-ask spreads.
+    """
+    if len(strikes) < 4:
+        return ivs
+    try:
+        coefs = np.polyfit(strikes, ivs, 3)
+        smoothed = np.polyval(coefs, strikes)
+        return np.clip(smoothed, 0.01, 3.0).tolist()
+    except Exception:
+        return ivs
 
 # --- DATA AGGREGATION PIPELINE ---
 def fetch_and_send_data(tier='fast'):
@@ -152,14 +163,16 @@ def fetch_and_send_data(tier='fast'):
         print(f"[{timestamp}] Executing {tier.upper()} scan...")
         
         spot = get_latest_price(TICKER)
+        spy_spot = get_latest_price(SPY_TICKER)
         fut = get_latest_price(FUTURES_TICKER)
         vix = get_latest_price(VIX_TICKER)
-        if spot == 0: return None, None
+        if spot == 0 or spy_spot == 0: return None, None
 
         basis_ratio = fut / spot if (spot > 0 and fut > 0) else 1.0
         
-        ticker = yf.Ticker(TICKER)
-        expirations = ticker.options
+        ticker_spx = yf.Ticker(TICKER)
+        ticker_spy = yf.Ticker(SPY_TICKER)
+        expirations = ticker_spx.options
         if not expirations: return None, None
 
         selected_exps = []
@@ -171,77 +184,127 @@ def fetch_and_send_data(tier='fast'):
             elif tier == 'slow' and days > 14: selected_exps.append(exp)
             elif tier == 'ui' and days <= 35: selected_exps.append(exp) 
 
-        all_opts = []
-        parsed_for_ui = [] 
-
-        chains_data = {}
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(fetch_chain_concurrently, ticker, exp): exp for exp in selected_exps}
-            for future in as_completed(futures):
+        # MULTI-THREADED DUAL FETCH (SPX + SPY)
+        chains_spx = {}
+        chains_spy = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures_spx = {executor.submit(fetch_chain_concurrently, ticker_spx, exp): exp for exp in selected_exps}
+            futures_spy = {executor.submit(fetch_chain_concurrently, ticker_spy, exp): exp for exp in selected_exps}
+            
+            for future in as_completed(futures_spx):
                 exp_key, chain = future.result()
-                if chain: chains_data[exp_key] = chain
+                if chain: chains_spx[exp_key] = chain
+            for future in as_completed(futures_spy):
+                exp_key, chain = future.result()
+                if chain: chains_spy[exp_key] = chain
 
-        last_valid_coc = None
+        last_valid_coc_spx = None
+        last_valid_coc_spy = None
+        parsed_for_ui = [] 
+        all_opts = []
 
-        for exp in sorted(chains_data.keys()):
-            chain = chains_data[exp]
-            exp_date = datetime.strptime(exp, '%Y-%m-%d').replace(hour=16, minute=0, second=0, tzinfo=NY_TZ)
-            T = calc_trading_T(exp_date, now_ny)
+        # Process chains
+        for exp in sorted(selected_exps):
+            T = calc_trading_T(datetime.strptime(exp, '%Y-%m-%d').replace(hour=16, minute=0, second=0, tzinfo=NY_TZ), now_ny)
             
-            current_coc = calculate_cost_of_carry(spot, chain.calls, chain.puts, T)
-            if current_coc is not None:
-                last_valid_coc = current_coc
-            
-            b_exp = last_valid_coc if last_valid_coc is not None else 0.0
+            # SPX Processing
+            if exp in chains_spx:
+                chain = chains_spx[exp]
+                current_coc = calculate_cost_of_carry(spot, chain.calls, chain.puts, T)
+                if current_coc is not None: last_valid_coc_spx = current_coc
+                b_exp = last_valid_coc_spx if last_valid_coc_spx is not None else 0.0
 
-            for opt_type, df in [('1', chain.calls), ('0', chain.puts)]:
-                if 'openInterest' in df.columns:
-                    df = df[df['openInterest'] > 0]
-                else:
-                    continue
+                for opt_type, df in [('1', chain.calls), ('0', chain.puts)]:
+                    if 'openInterest' in df.columns:
+                        df = df[df['openInterest'] > 0]
+                    else: continue
+                    df = df[(df['strike'] > spot * 0.85) & (df['strike'] < spot * 1.15)]
+                    is_call = (opt_type == '1')
+                    if df.empty: continue
                     
-                df = df[(df['strike'] > spot * 0.85) & (df['strike'] < spot * 1.15)]
-                is_call = (opt_type == '1')
-                
-                if df.empty: continue
-                
-                bids, asks, lasts = df['bid'].values, df['ask'].values, df['lastPrice'].values
-                prices = np.where((bids > 0) & (asks > 0), (bids + asks) / 2.0, lasts)
-                df['price'] = np.nan_to_num(prices)
-                
-                strikes = df['strike'].values
-                prices_arr = df['price'].values
-                vols = df.get('volume', pd.Series(0.0, index=df.index)).fillna(0.0).values
-                ois = df['openInterest'].values
-                yf_ivs = df.get('impliedVolatility', pd.Series(0.20, index=df.index)).fillna(0.20).values
-                yf_ivs = np.where(yf_ivs == 0, 0.20, yf_ivs)
+                    bids, asks, lasts = df['bid'].values, df['ask'].values, df['lastPrice'].values
+                    prices = np.where((bids > 0) & (asks > 0), (bids + asks) / 2.0, lasts)
+                    df['price'] = np.nan_to_num(prices)
+                    
+                    strikes = df['strike'].values
+                    prices_arr = df['price'].values
+                    vols = df.get('volume', pd.Series(0.0, index=df.index)).fillna(0.0).values
+                    ois = df['openInterest'].values
+                    yf_ivs = df.get('impliedVolatility', pd.Series(0.20, index=df.index)).fillna(0.20).values
+                    yf_ivs = np.where(yf_ivs == 0, 0.20, yf_ivs)
 
-                # FAST VECTOR-ZIP LIST COMPREHENSION (Bypasses slow iterrows series creation)
-                exact_ivs = [
-                    calculate_implied_iv_brent(spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fb)
-                    for k, p, fb in zip(strikes, prices_arr, yf_ivs)
-                ]
+                    exact_ivs = [
+                        calculate_implied_iv_brent(spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fb)
+                        for k, p, fb in zip(strikes, prices_arr, yf_ivs)
+                    ]
+                    # Apply Volatility Smile Polynomial Smoothing (Claude's Trick #3)
+                    exact_ivs = smooth_volatility_smile(strikes, exact_ivs)
 
-                for strike, price, vol, oi, exact_iv in zip(strikes, prices_arr, vols, ois, exact_ivs):
-                    uid = f"{exp}_{opt_type}_{strike}"
+                    for strike, price, vol, oi, exact_iv in zip(strikes, prices_arr, vols, ois, exact_ivs):
+                        uid = f"{exp}_{opt_type}_{strike}"
+                        flow_dir = 0
+                        if uid in history_state:
+                            prev_price, prev_vol = history_state[uid]
+                            if vol > prev_vol: flow_dir = 1 if price > prev_price else -1
+                        history_state[uid] = (price, vol)
+                        
+                        all_opts.append(f"{T:.6f},{opt_type},{strike},{oi},{exact_iv:.4f},{flow_dir},{b_exp:.6f},SPX")
+                        parsed_for_ui.append({
+                            'exp': exp, 'dte': T, 'type': opt_type, 
+                            'strike': strike, 'oi': oi, 'iv': exact_iv, 'vol': vol,
+                            'b': b_exp, 'ticker': 'SPX'
+                        })
+
+            # SPY Processing
+            if exp in chains_spy:
+                chain = chains_spy[exp]
+                current_coc = calculate_cost_of_carry(spy_spot, chain.calls, chain.puts, T)
+                if current_coc is not None: last_valid_coc_spy = current_coc
+                b_exp = last_valid_coc_spy if last_valid_coc_spy is not None else 0.0
+
+                for opt_type, df in [('1', chain.calls), ('0', chain.puts)]:
+                    if 'openInterest' in df.columns:
+                        df = df[df['openInterest'] > 0]
+                    else: continue
+                    df = df[(df['strike'] > spy_spot * 0.85) & (df['strike'] < spy_spot * 1.15)]
+                    is_call = (opt_type == '1')
+                    if df.empty: continue
                     
-                    flow_dir = 0
-                    if uid in history_state:
-                        prev_price, prev_vol = history_state[uid]
-                        if vol > prev_vol:
-                            flow_dir = 1 if price > prev_price else -1
-                    history_state[uid] = (price, vol)
+                    bids, asks, lasts = df['bid'].values, df['ask'].values, df['lastPrice'].values
+                    prices = np.where((bids > 0) & (asks > 0), (bids + asks) / 2.0, lasts)
+                    df['price'] = np.nan_to_num(prices)
                     
-                    all_opts.append(f"{T:.6f},{opt_type},{strike},{oi},{exact_iv:.4f},{flow_dir},{b_exp:.6f}")
-                    parsed_for_ui.append({
-                        'exp': exp, 'dte': T, 'type': opt_type, 
-                        'strike': strike, 'oi': oi, 'iv': exact_iv, 'vol': vol,
-                        'b': b_exp 
-                    })
+                    strikes = df['strike'].values
+                    prices_arr = df['price'].values
+                    vols = df.get('volume', pd.Series(0.0, index=df.index)).fillna(0.0).values
+                    ois = df['openInterest'].values
+                    yf_ivs = df.get('impliedVolatility', pd.Series(0.20, index=df.index)).fillna(0.20).values
+                    yf_ivs = np.where(yf_ivs == 0, 0.20, yf_ivs)
+
+                    exact_ivs = [
+                        calculate_implied_iv_brent(spy_spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fb)
+                        for k, p, fb in zip(strikes, prices_arr, yf_ivs)
+                    ]
+                    exact_ivs = smooth_volatility_smile(strikes, exact_ivs)
+
+                    for strike, price, vol, oi, exact_iv in zip(strikes, prices_arr, vols, ois, exact_ivs):
+                        uid = f"{exp}_{opt_type}_{strike}"
+                        flow_dir = 0
+                        if uid in history_state:
+                            prev_price, prev_vol = history_state[uid]
+                            if vol > prev_vol: flow_dir = 1 if price > prev_price else -1
+                        history_state[uid] = (price, vol)
+                        
+                        all_opts.append(f"{T:.6f},{opt_type},{strike},{oi},{exact_iv:.4f},{flow_dir},{b_exp:.6f},SPY")
+                        parsed_for_ui.append({
+                            'exp': exp, 'dte': T, 'type': opt_type, 
+                            'strike': strike, 'oi': oi, 'iv': exact_iv, 'vol': vol,
+                            'b': b_exp, 'ticker': 'SPY'
+                        })
 
         if not all_opts: return None, None
 
-        header_coc = last_valid_coc if last_valid_coc is not None else 0.0
+        header_coc = last_valid_coc_spx if last_valid_coc_spx is not None else 0.0
         header = f"{now_ny.timestamp()},{basis_ratio:.6f},{vix:.4f},{spot:.2f},{header_coc:.6f}"
         payload = header + "|" + "|".join(all_opts)
         
@@ -249,7 +312,7 @@ def fetch_and_send_data(tier='fast'):
         for i in range(0, len(payload), chunk_size):
             sock.sendto(payload[i:i+chunk_size].encode(), (UDP_IP, UDP_PORT))
             
-        print(f"[{timestamp}] UDP Packet Sent! ({len(all_opts)} strikes processed)")
+        print(f"[{timestamp}] UDP Combo Packet Sent! ({len(all_opts)} total contracts parsed)")
         return {'time': timestamp, 'spot': spot}, parsed_for_ui
 
     except Exception as e:
@@ -286,6 +349,7 @@ class DebugGEXUI:
         self.show_walls = False
         self.show_abs_gex = False
         self.show_profiles = False
+        self.show_combo = True # New Toggle State for SPX+SPY combo
 
         self.custom_xlim = None
         self.custom_ylim = None
@@ -325,6 +389,10 @@ class DebugGEXUI:
 
         self.btn_filter = tk.Button(ctrl_box, text="✅ 0DTE Included", command=self.toggle_0dte, bg="#006600", fg="white")
         self.btn_filter.pack(side=tk.LEFT, padx=10)
+
+        # SPY Combo Toggle Button (Claude's Trick #1)
+        self.btn_combo = tk.Button(ctrl_box, text="🍔 Combo GEX (SPX+SPY): ON", command=self.toggle_combo, bg="#006600", fg="white")
+        self.btn_combo.pack(side=tk.LEFT, padx=10)
 
         self.btn_walls = tk.Button(ctrl_box, text="🧱 Walls: OFF", command=self.toggle_walls, bg="#444", fg="white")
         self.btn_walls.pack(side=tk.LEFT, padx=5)
@@ -390,6 +458,14 @@ class DebugGEXUI:
         self.btn_filter.config(text="✅ 0DTE Included" if self.include_0dte else "❌ 0DTE Excluded", bg="#006600" if self.include_0dte else "#660000")
         if self.timestamps: self.render_plot()
 
+    def toggle_combo(self):
+        self.show_combo = not self.show_combo
+        self.btn_combo.config(
+            text="🍔 Combo GEX (SPX+SPY): ON" if self.show_combo else "🍔 Combo GEX (SPX+SPY): OFF",
+            bg="#006600" if self.show_combo else "#660000"
+        )
+        if self.timestamps: self.render_plot()
+
     def toggle_walls(self):
         self.show_walls = not self.show_walls
         self.btn_walls.config(text="🧱 Walls: ON" if self.show_walls else "🧱 Walls: OFF", bg="#006600" if self.show_walls else "#444")
@@ -450,6 +526,10 @@ class DebugGEXUI:
         df = pd.DataFrame(data['options'])
         if df.empty: return
         
+        # 1. OPTION TO DISABLE SPY CALCULATIONS ON RENDERING (Claude's Trick #1)
+        if not self.show_combo:
+            df = df[df['ticker'] == 'SPX']
+            
         today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
         df['is_0dte'] = df['exp'] == today_str
         
@@ -460,16 +540,33 @@ class DebugGEXUI:
                 self.canvas.draw()
                 return
 
-        # VECTORIZED GEX CALCULATION
+        # 2. INTRODUCE SCALE MAPS FOR DUAL TICKER PROCESSING (SPX Spot vs SPY Spot)
+        is_spy = df['ticker'] == 'SPY'
+        
+        # SPY underlying spot scale is 1/10 of SPX
+        df['spot_val'] = np.where(is_spy, spot / 10.0, spot)
+        
+        # SPY native strikes are 1/10 of SPX
+        df['strike_val'] = df['strike'].values
+        
         df['gamma'] = calc_gamma_vectorized(
-            spot, 
-            df['strike'].values, 
+            df['spot_val'].values, 
+            df['strike_val'].values, 
             df['dte'].values, 
             df['iv'].values, 
             df['b'].values
         )
-        df['base_gex'] = df['gamma'] * df['oi'] * (spot ** 2)
-        df['actual_gex'] = np.where(df['type'] == '1', df['base_gex'], -df['base_gex'])
+        
+        # Native Contract-Level GEX Calculation
+        df['base_gex'] = df['gamma'] * df['oi'] * (df['spot_val'] ** 2)
+        
+        # Scale SPY Native GEX to SPX equivalent (GEX_SPX = GEX_SPY / 10)
+        df['scaled_gex'] = df['base_gex']
+        
+        # Align SPY strikes back to SPX scale (Strike_SPX = Strike_SPY * 10)
+        df['plot_strike'] = np.where(is_spy, df['strike_val'] * 10.0, df['strike_val'])
+
+        df['actual_gex'] = np.where(df['type'] == '1', df['scaled_gex'], -df['scaled_gex'])
         df['abs_actual_gex'] = np.abs(df['actual_gex'])
 
         # Aggregate Statistics
@@ -489,11 +586,11 @@ class DebugGEXUI:
         )
         self.lbl_stats.config(text=stats_msg)
 
-        # STABLE NON-LAMBDA GROUPBY AGGREGATIONS
-        net_gex = df.groupby('strike')['actual_gex'].sum()
-        abs_gex = df.groupby('strike')['abs_actual_gex'].sum()
-        call_gex = df[df['type'] == '1'].groupby('strike')['abs_actual_gex'].sum()
-        put_gex = df[df['type'] == '0'].groupby('strike')['abs_actual_gex'].sum()
+        # STABLE NON-LAMBDA GROUPBY AGGREGATIONS (SPX aligned Strike scale)
+        net_gex = df.groupby('plot_strike')['actual_gex'].sum()
+        abs_gex = df.groupby('plot_strike')['abs_actual_gex'].sum()
+        call_gex = df[df['type'] == '1'].groupby('plot_strike')['abs_actual_gex'].sum()
+        put_gex = df[df['type'] == '0'].groupby('plot_strike')['abs_actual_gex'].sum()
 
         agg_df = pd.DataFrame({
             'net_gex': net_gex, 
@@ -504,7 +601,7 @@ class DebugGEXUI:
 
         self.ax.clear()
 
-        strikes = agg_df['strike'].values
+        strikes = agg_df['plot_strike'].values
         net_gex_vals = agg_df['net_gex'].values / 1e9
         abs_gex_vals = agg_df['abs_gex'].values / 1e9
 
@@ -527,20 +624,21 @@ class DebugGEXUI:
         self.ax.axhline(y=spot, color='gray', linestyle='-', linewidth=0.8, label=f'Spot: {spot:.2f}')
 
         if self.show_walls and not agg_df.empty:
-            call_wall_strike = agg_df.loc[agg_df['net_gex'].idxmax(), 'strike']
-            put_wall_strike = agg_df.loc[agg_df['net_gex'].idxmin(), 'strike']
+            call_wall_strike = agg_df.loc[agg_df['net_gex'].idxmax(), 'plot_strike']
+            put_wall_strike = agg_df.loc[agg_df['net_gex'].idxmin(), 'plot_strike']
             
             if agg_df['net_gex'].max() > 0:
                 self.ax.axhline(y=call_wall_strike, color='#00ff00', linestyle=':', linewidth=2, label=f'Call Wall: {call_wall_strike}')
             if agg_df['net_gex'].min() < 0:
                 self.ax.axhline(y=put_wall_strike, color='#ff0000', linestyle=':', linewidth=2, label=f'Put Wall: {put_wall_strike}')
 
-        title_text = f"SPX Gamma Exposure - Time: {ts}"
+        title_text = f"S&P 500 Gamma Exposure - Time: {ts}"
         if not self.include_0dte: title_text += " [0DTE EXCLUDED]"
+        if self.show_combo: title_text += " [SPX + SPY CONSOLIDATED]"
         
         self.ax.set_title(title_text, color='white', fontweight='bold')
         self.ax.set_xlabel("Dealer Exposure per 1% Move ($ Billions)", color='white')
-        self.ax.set_ylabel("Strike Price", color='white')
+        self.ax.set_ylabel("S&P 500 Strike Scale", color='white')
         self.ax.tick_params(colors='white')
         self.ax.grid(True, color='#444', alpha=0.3)
         self.ax.legend(loc="upper right", facecolor='#333', labelcolor='white')
