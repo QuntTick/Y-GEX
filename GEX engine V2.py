@@ -56,16 +56,13 @@ def calc_trading_T(exp_date, now_ny):
     calendar_days = total_secs / 86400.0
     
     if calendar_days <= 1.0:
-        # Use expiry date's close time (4:00 PM NY), not today's (Claude's Fix)
         target_close = exp_date.replace(hour=16, minute=0, second=0, microsecond=0)
         secs_to_close = (target_close - now_ny).total_seconds()
         if secs_to_close <= 0: return 1e-5
         
-        # Cap at 1 full session of 390 minutes (Claude's Fix)
         trading_mins_left = min(secs_to_close / 60.0, 390.0)
         return max(1e-5, trading_mins_left / TRADING_MINS_PER_YEAR)
     
-    # Multi-day handling (Approx. 252-day business year)
     approx_trading_days = calendar_days * (5.0 / 7.0)
     return max(1e-5, approx_trading_days / 252.0)
 
@@ -140,10 +137,6 @@ def prune_history_state():
 
 # --- SKEW / VOLATILITY SMILE SMOOTHING ---
 def smooth_volatility_smile(strikes, ivs):
-    """
-    Fits a 3rd-degree polynomial to model the mathematical volatility smile/skew.
-    Smooths out pricing inconsistencies caused by standard exchange bid-ask spreads.
-    """
     if len(strikes) < 4:
         return ivs
     try:
@@ -152,6 +145,36 @@ def smooth_volatility_smile(strikes, ivs):
         return np.clip(smoothed, 0.01, 3.0).tolist()
     except Exception:
         return ivs
+
+# --- DECOUPLED UDP TRANSMISSION SERVER (Claude's Request) ---
+def transmit_udp_payload(spot, basis_ratio, vix, cost_of_carry, options_list):
+    """
+    Standardized, isolated UDP packaging and transmission function.
+    Aggregates headers and serializes raw options vectors into chunks.
+    """
+    try:
+        timestamp = datetime.now(NY_TZ).timestamp()
+        
+        # Header Format: Timestamp,BasisRatio,VIX,Spot,CostOfCarry
+        header = f"{timestamp},{basis_ratio:.6f},{vix:.4f},{spot:.2f},{cost_of_carry:.6f}"
+        
+        # Options format: DTE,IsCall,Strike,OI,IV,FlowDir,Carry,Ticker
+        opt_payloads = []
+        for opt in options_list:
+            opt_payloads.append(
+                f"{opt['dte']:.6f},{opt['type']},{opt['strike']},{opt['oi']},"
+                f"{opt['iv']:.4f},{opt['flow_dir']},{opt['b']:.6f},{opt['ticker']}"
+            )
+        
+        payload = header + "|" + "|".join(opt_payloads)
+        
+        # Chunking to prevent UDP buffer overflows (> 60KB payload)
+        chunk_size = 50000 
+        for i in range(0, len(payload), chunk_size):
+            sock.sendto(payload[i:i+chunk_size].encode(), (UDP_IP, UDP_PORT))
+            
+    except Exception as e:
+        print(f"UDP Transmission Failure: {e}")
 
 # --- DATA AGGREGATION PIPELINE ---
 def fetch_and_send_data(tier='fast'):
@@ -184,7 +207,6 @@ def fetch_and_send_data(tier='fast'):
             elif tier == 'slow' and days > 14: selected_exps.append(exp)
             elif tier == 'ui' and days <= 35: selected_exps.append(exp) 
 
-        # MULTI-THREADED DUAL FETCH (SPX + SPY)
         chains_spx = {}
         chains_spy = {}
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -201,7 +223,6 @@ def fetch_and_send_data(tier='fast'):
         last_valid_coc_spx = None
         last_valid_coc_spy = None
         parsed_for_ui = [] 
-        all_opts = []
 
         # Process chains
         for exp in sorted(selected_exps):
@@ -237,22 +258,26 @@ def fetch_and_send_data(tier='fast'):
                         calculate_implied_iv_brent(spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fb)
                         for k, p, fb in zip(strikes, prices_arr, yf_ivs)
                     ]
-                    # Apply Volatility Smile Polynomial Smoothing (Claude's Trick #3)
                     exact_ivs = smooth_volatility_smile(strikes, exact_ivs)
 
-                    for strike, price, vol, oi, exact_iv in zip(strikes, prices_arr, vols, ois, exact_ivs):
+                    # Dynamic flow calculation
+                    flow_dirs = []
+                    for strike, price, vol in zip(strikes, prices_arr, vols):
                         uid = f"{exp}_{opt_type}_{strike}"
                         flow_dir = 0
                         if uid in history_state:
                             prev_price, prev_vol = history_state[uid]
-                            if vol > prev_vol: flow_dir = 1 if price > prev_price else -1
+                            if vol > prev_vol:
+                                if price > prev_price: flow_dir = 1
+                                elif price < prev_price: flow_dir = -1
                         history_state[uid] = (price, vol)
-                        
-                        all_opts.append(f"{T:.6f},{opt_type},{strike},{oi},{exact_iv:.4f},{flow_dir},{b_exp:.6f},SPX")
+                        flow_dirs.append(flow_dir)
+
+                    for strike, price, vol, oi, exact_iv, flow_dir in zip(strikes, prices_arr, vols, ois, exact_ivs, flow_dirs):
                         parsed_for_ui.append({
                             'exp': exp, 'dte': T, 'type': opt_type, 
                             'strike': strike, 'oi': oi, 'iv': exact_iv, 'vol': vol,
-                            'b': b_exp, 'ticker': 'SPX'
+                            'b': b_exp, 'ticker': 'SPX', 'flow_dir': flow_dir
                         })
 
             # SPY Processing
@@ -287,32 +312,32 @@ def fetch_and_send_data(tier='fast'):
                     ]
                     exact_ivs = smooth_volatility_smile(strikes, exact_ivs)
 
-                    for strike, price, vol, oi, exact_iv in zip(strikes, prices_arr, vols, ois, exact_ivs):
+                    flow_dirs = []
+                    for strike, price, vol in zip(strikes, prices_arr, vols):
                         uid = f"{exp}_{opt_type}_{strike}"
                         flow_dir = 0
                         if uid in history_state:
                             prev_price, prev_vol = history_state[uid]
-                            if vol > prev_vol: flow_dir = 1 if price > prev_price else -1
+                            if vol > prev_vol:
+                                if price > prev_price: flow_dir = 1
+                                elif price < prev_price: flow_dir = -1
                         history_state[uid] = (price, vol)
-                        
-                        all_opts.append(f"{T:.6f},{opt_type},{strike},{oi},{exact_iv:.4f},{flow_dir},{b_exp:.6f},SPY")
+                        flow_dirs.append(flow_dir)
+
+                    for strike, price, vol, oi, exact_iv, flow_dir in zip(strikes, prices_arr, vols, ois, exact_ivs, flow_dirs):
                         parsed_for_ui.append({
                             'exp': exp, 'dte': T, 'type': opt_type, 
                             'strike': strike, 'oi': oi, 'iv': exact_iv, 'vol': vol,
-                            'b': b_exp, 'ticker': 'SPY'
+                            'b': b_exp, 'ticker': 'SPY', 'flow_dir': flow_dir
                         })
 
-        if not all_opts: return None, None
+        if not parsed_for_ui: return None, None
 
+        # BROADCAST DATA OVER SOCKET IN DEDICATED FUNCTION
         header_coc = last_valid_coc_spx if last_valid_coc_spx is not None else 0.0
-        header = f"{now_ny.timestamp()},{basis_ratio:.6f},{vix:.4f},{spot:.2f},{header_coc:.6f}"
-        payload = header + "|" + "|".join(all_opts)
+        transmit_udp_payload(spot, basis_ratio, vix, header_coc, parsed_for_ui)
         
-        chunk_size = 50000 
-        for i in range(0, len(payload), chunk_size):
-            sock.sendto(payload[i:i+chunk_size].encode(), (UDP_IP, UDP_PORT))
-            
-        print(f"[{timestamp}] UDP Combo Packet Sent! ({len(all_opts)} total contracts parsed)")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] UDP Broadcast Completed.")
         return {'time': timestamp, 'spot': spot}, parsed_for_ui
 
     except Exception as e:
@@ -349,7 +374,7 @@ class DebugGEXUI:
         self.show_walls = False
         self.show_abs_gex = False
         self.show_profiles = False
-        self.show_combo = True # New Toggle State for SPX+SPY combo
+        self.show_combo = True 
 
         self.custom_xlim = None
         self.custom_ylim = None
@@ -390,7 +415,6 @@ class DebugGEXUI:
         self.btn_filter = tk.Button(ctrl_box, text="✅ 0DTE Included", command=self.toggle_0dte, bg="#006600", fg="white")
         self.btn_filter.pack(side=tk.LEFT, padx=10)
 
-        # SPY Combo Toggle Button (Claude's Trick #1)
         self.btn_combo = tk.Button(ctrl_box, text="🍔 Combo GEX (SPX+SPY): ON", command=self.toggle_combo, bg="#006600", fg="white")
         self.btn_combo.pack(side=tk.LEFT, padx=10)
 
@@ -526,7 +550,6 @@ class DebugGEXUI:
         df = pd.DataFrame(data['options'])
         if df.empty: return
         
-        # 1. OPTION TO DISABLE SPY CALCULATIONS ON RENDERING (Claude's Trick #1)
         if not self.show_combo:
             df = df[df['ticker'] == 'SPX']
             
@@ -540,13 +563,8 @@ class DebugGEXUI:
                 self.canvas.draw()
                 return
 
-        # 2. INTRODUCE SCALE MAPS FOR DUAL TICKER PROCESSING (SPX Spot vs SPY Spot)
         is_spy = df['ticker'] == 'SPY'
-        
-        # SPY underlying spot scale is 1/10 of SPX
         df['spot_val'] = np.where(is_spy, spot / 10.0, spot)
-        
-        # SPY native strikes are 1/10 of SPX
         df['strike_val'] = df['strike'].values
         
         df['gamma'] = calc_gamma_vectorized(
@@ -557,13 +575,8 @@ class DebugGEXUI:
             df['b'].values
         )
         
-        # Native Contract-Level GEX Calculation
         df['base_gex'] = df['gamma'] * df['oi'] * (df['spot_val'] ** 2)
-        
-        # Scale SPY Native GEX to SPX equivalent (GEX_SPX = GEX_SPY / 10)
-        df['scaled_gex'] = df['base_gex']
-        
-        # Align SPY strikes back to SPX scale (Strike_SPX = Strike_SPY * 10)
+        df['scaled_gex'] = np.where(is_spy, df['base_gex'] / 10.0, df['base_gex'])
         df['plot_strike'] = np.where(is_spy, df['strike_val'] * 10.0, df['strike_val'])
 
         df['actual_gex'] = np.where(df['type'] == '1', df['scaled_gex'], -df['scaled_gex'])
@@ -586,7 +599,7 @@ class DebugGEXUI:
         )
         self.lbl_stats.config(text=stats_msg)
 
-        # STABLE NON-LAMBDA GROUPBY AGGREGATIONS (SPX aligned Strike scale)
+        # STABLE NON-LAMBDA GROUPBY AGGREGATIONS
         net_gex = df.groupby('plot_strike')['actual_gex'].sum()
         abs_gex = df.groupby('plot_strike')['abs_actual_gex'].sum()
         call_gex = df[df['type'] == '1'].groupby('plot_strike')['abs_actual_gex'].sum()
