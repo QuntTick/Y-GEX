@@ -1,400 +1,649 @@
-#region Using declarations
-using System;
-using System.Collections.Generic;
-using System.ComponentModel.DataAnnotations;
-using System.Linq;
-using System.Windows.Media;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading.Tasks;
-using System.IO;
-using NinjaTrader.Cbi;
-using NinjaTrader.Gui;
-using NinjaTrader.Gui.Chart;
-using NinjaTrader.Data;
-using NinjaTrader.NinjaScript;
-using NinjaTrader.NinjaScript.DrawingTools;
-using SharpDX.Direct2D1;
-#endregion
+# --- START OF FILE GEX engine V3.py ---
 
-public enum GexDisplayMode { NetGex, CallGexOnly, PutGexOnly }
+import pandas as pd
+import yfinance as yf
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import socket
+import math
+import numpy as np
+import threading
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from scipy.optimize import brentq
+import tkinter as tk
+from tkinter import ttk
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-namespace NinjaTrader.NinjaScript.Indicators
-{
-    public class GexHeatmapTCP_Precision : Indicator
-    {
-        #region Classes & Variables
-        public class OptionData
-        {
-            public double DTE; 
-            public bool IsCall;
-            public double Strike; 
-            public int OI;
-            public double IV;
-            public int FlowDir;
-            public string Ticker;
-        }
+# Suppress pandas SettingWithCopyWarning for clean terminal
+warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
 
-        public class GexSnapshot
-        {
-            public double Timestamp;
-            public double BasisRatio;  
-            public double RiskFreeRate; 
-            public double DividendYield; 
-            public double SnapshotSpot; 
-            public List<OptionData> Options = new List<OptionData>();
-        }
+# --- CONFIGURATION ---
+TICKER = "^SPX"
+SPY_TICKER = "SPY"
+FUTURES_TICKER = "ES=F"
+VIX_TICKER = "^VIX"
+TCP_IP = "127.0.0.1"
+TCP_PORT = 9000
 
-        public class GexRenderSnapshot
-        {
-            public int StartBar;
-            public int EndBar; 
-            public double BasisRatio;
-            public double MaxGex;
-            public Dictionary<double, double> Profile;
-        }
+# Constants
+RISK_FREE_RATE = 0.053 # r = 5.3%
+NY_TZ = ZoneInfo("America/New_York")
+TRADING_MINS_PER_YEAR = 98280.0  # 252 days * 390 trading minutes per day
 
-        private TcpListener tcpListener;
-        private Task tcpTask;
-        private bool isListening = false;
+history_state = {} 
+
+# --- ROBUST DATA FETCHER ---
+def get_latest_price(symbol):
+    try:
+        t = yf.Ticker(symbol)
+        hist = t.history(period="1d", interval="1m")
+        if not hist.empty: return float(hist['Close'].iloc[-1])
+        info = t.fast_info
+        if 'last_price' in info and info['last_price'] is not None: return float(info['last_price'])
+        hist_d = t.history(period="5d", interval="1d")
+        if not hist_d.empty: return float(hist_d['Close'].iloc[-1])
+    except:
+        pass
+    return 0.0
+
+# --- TRADING-TIME FRACTION CALCULATOR ---
+def calc_trading_T(exp_date, now_ny):
+    total_secs = (exp_date - now_ny).total_seconds()
+    if total_secs <= 0: return 1e-5
+    
+    calendar_days = total_secs / 86400.0
+    
+    if calendar_days <= 1.0:
+        target_close = exp_date.replace(hour=16, minute=0, second=0, microsecond=0)
+        secs_to_close = (target_close - now_ny).total_seconds()
+        if secs_to_close <= 0: return 1e-5
         
-        private readonly object dataLock = new object();
-        private GexSnapshot latestSnapshot = null;
+        trading_mins_left = min(secs_to_close / 60.0, 390.0)
+        return max(1e-5, trading_mins_left / TRADING_MINS_PER_YEAR)
+    
+    approx_trading_days = calendar_days * (5.0 / 7.0)
+    return max(1e-5, approx_trading_days / 252.0)
 
-        private readonly object historyLock = new object();
-        private List<GexRenderSnapshot> gexHistory = new List<GexRenderSnapshot>();
+# --- UNIFIED GENERALIZED BSM FRAMEWORK ---
+def norm_cdf_fast(x):
+    return (1.0 + math.erf(x / 1.4142135623730951)) / 2.0 
 
-        private double lastCalcPrice = 0;
-        private DateTime lastCalcTime = DateTime.MinValue;
+def bs_price_scalar(S, K, T, v, r, b, is_call):
+    if T <= 0 or v <= 0: return max(0.0, S - K) if is_call else max(0.0, K - S)
+    d1 = (math.log(S / K) + (b + 0.5 * v**2) * T) / (v * math.sqrt(T))
+    d2 = d1 - v * math.sqrt(T)
+    if is_call:
+        return S * math.exp((b - r) * T) * norm_cdf_fast(d1) - K * math.exp(-r * T) * norm_cdf_fast(d2)
+    else:
+        return K * math.exp(-r * T) * norm_cdf_fast(-d2) - S * math.exp((b - r) * T) * norm_cdf_fast(-d1)
+
+def calculate_implied_iv_brent(S, K, T, r, b, market_price, is_call, fallback_iv=0.20):
+    if market_price <= 0 or T <= 1e-5: return fallback_iv
+    
+    def objective_func(sigma):
+        return bs_price_scalar(S, K, T, sigma, r, b, is_call) - market_price
+
+    try:
+        return brentq(objective_func, 1e-3, 5.0, xtol=1e-4, maxiter=50)
+    except (ValueError, RuntimeError):
+        return fallback_iv 
+
+def fetch_chain_concurrently(ticker_obj, exp):
+    try:
+        return exp, ticker_obj.option_chain(exp)
+    except Exception:
+        return exp, None
+
+def prune_history_state():
+    global history_state
+    today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
+    stale_keys = [k for k in history_state.keys() if k.split('_')[0] < today_str]
+    for k in stale_keys:
+        history_state.pop(k, None)
+
+# --- SKEW / VOLATILITY SMILE SMOOTHING ---
+def smooth_volatility_smile(strikes, ivs):
+    if len(ivs) < 5:
+        return ivs
+    s = pd.Series(ivs)
+    smoothed = s.rolling(window=5, center=True, min_periods=1).median()
+    return np.clip(smoothed.values, 0.05, 3.0).tolist()
+
+# --- TCP TRANSMISSION CLIENT (NinjaTrader Target) ---
+def transmit_tcp_payload(spot, basis_ratio, cost_of_carry, options_list):
+    try:
+        timestamp = datetime.now(NY_TZ).timestamp()
         
-        // --- NEW: Anchored Basis to prevent visual wiggling ---
-        private double anchoredBasis = 0;
-
-        private SharpDX.Direct2D1.SolidColorBrush[] positiveBrushes; 
-        private SharpDX.Direct2D1.SolidColorBrush[] negativeBrushes;
-        #endregion
-
-        #region Parameters
-        [NinjaScriptProperty]
-        [Display(Name="Display Mode", Order=1, GroupName="1. Visuals")]
-        public GexDisplayMode DisplayMode { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 100)]
-        [Display(Name="Filter Cutoff %", Order=2, GroupName="1. Visuals")]
-        public double CutoffPercent { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name="Skew Sensitivity", Order=3, GroupName="1. Visuals")]
-        public double SkewSensitivity { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(100, 5000)]
-        [Display(Name="History Limit (Bars)", Order=4, GroupName="1. Visuals")]
-        public int HistoryLimit { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name="TCP Port", Order=1, GroupName="2. System")]
-        public int TcpPort { get; set; } 
-        #endregion
-
-        protected override void OnStateChange()
-        {
-            if (State == State.SetDefaults)
-            {
-                Description = "TCP GEX Engine V3 (Anchored Heatmap).";
-                Name = "GEX Engine V3 (TCP Heatmap)";
-                Calculate = Calculate.OnEachTick;
-                IsOverlay = true;
-                DrawOnPricePanel = true;
-                CutoffPercent = 2.0;
-                SkewSensitivity = 1.5; 
-                HistoryLimit = 1000;
-                TcpPort = 9000;
-                DisplayMode = GexDisplayMode.NetGex;
-            }
-            else if (State == State.Configure)
-            {
-                ZOrder = -1;
-            }
-            else if (State == State.DataLoaded)
-            {
-                anchoredBasis = 0; // Reset anchor on load
-                positiveBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
-                negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
-
-                isListening = true;
-                tcpTask = Task.Run(() => StartTcpServer());
-            }
-            else if (State == State.Terminated)
-            {
-                isListening = false;
-                if (tcpListener != null) tcpListener.Stop();
-                DisposeBrushes();
-            }
-        }
-
-        #region TCP Telemetry System
-        private async Task StartTcpServer()
-        {
-            try 
-            {
-                tcpListener = new TcpListener(IPAddress.Any, TcpPort);
-                tcpListener.Start();
-
-                while (isListening)
-                {
-                    TcpClient client = await tcpListener.AcceptTcpClientAsync();
-                    Task.Run(() => HandleClient(client));
-                }
-            }
-            catch (Exception ex)
-            {
-                Print("TCP Server Error: " + ex.Message);
-            }
-        }
-
-        private void HandleClient(TcpClient client)
-        {
-            try
-            {
-                using (NetworkStream stream = client.GetStream())
-                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
-                {
-                    string payload = reader.ReadToEnd();
-                    ProcessPayload(payload);
-                }
-            }
-            catch { }
-            finally { client.Close(); }
-        }
-
-        private void ProcessPayload(string payload)
-        {
-            try
-            {
-                string[] parts = payload.Split('|');
-                if (parts.Length < 2) return;
-
-                string[] header = parts[0].Split(',');
-                GexSnapshot newSnap = new GexSnapshot
-                {
-                    Timestamp = double.Parse(header[0]),
-                    BasisRatio = double.Parse(header[1]),
-                    RiskFreeRate = double.Parse(header[2]),
-                    DividendYield = double.Parse(header[3]),
-                    SnapshotSpot = double.Parse(header[4])
-                };
-
-                for (int i = 1; i < parts.Length; i++)
-                {
-                    string[] row = parts[i].Split(',');
-                    if (row.Length < 7) continue;
-
-                    newSnap.Options.Add(new OptionData
-                    {
-                        DTE = double.Parse(row[0]),
-                        IsCall = row[1] == "1",
-                        Strike = double.Parse(row[2]),
-                        OI = (int)double.Parse(row[3]),
-                        IV = double.Parse(row[4]),
-                        FlowDir = (int)double.Parse(row[5]),
-                        Ticker = row[6]
-                    });
-                }
-
-                lock (dataLock) { latestSnapshot = newSnap; }
-                
-                if (ChartControl != null)
-                    ChartControl.Dispatcher.InvokeAsync(() => ChartControl.InvalidateVisual());
-            }
-            catch { }
-        }
-        #endregion
-
-        #region Precision Math Engine with Skew Shifting
-        private static double NormPDF(double x) { return Math.Exp(-x * x / 2.0) / Math.Sqrt(2.0 * Math.PI); }
-
-        private double GetShiftedIV(double baseIV, double currentSpot, double referenceSpot)
-        {
-            if (referenceSpot <= 0) return baseIV;
-            double priceShiftPercent = (currentSpot - referenceSpot) / referenceSpot;
-            double shiftedIV = baseIV * (1.0 - (priceShiftPercent * SkewSensitivity));
-            return Math.Max(0.01, Math.Min(2.5, shiftedIV));
-        }
-
-        private double CalculateExactGamma(double S, double K, double T, double v, double r, double q) {
-            if (T <= 0 || v <= 0 || S <= 0 || K <= 0) return 0.0;
-            double d1 = (Math.Log(S / K) + (r - q + v * v / 2.0) * T) / (v * Math.Sqrt(T));
-            return (Math.Exp(-q * T) * NormPDF(d1)) / (S * v * Math.Sqrt(T));
-        }
-        #endregion
-
-        protected override void OnBarUpdate()
-        {
-            if (CurrentBars[0] < 0 || latestSnapshot == null) return;
+        # Deduce the dividend yield based on our carry calculation to pass to C#
+        div_yield = RISK_FREE_RATE - cost_of_carry
+        
+        # Header Format: Timestamp, BasisRatio, RiskFreeRate, DividendYield, SpxSpot
+        header = f"{timestamp},{basis_ratio:.6f},{RISK_FREE_RATE:.6f},{div_yield:.6f},{spot:.2f}"
+        
+        opt_payloads = []
+        for opt in options_list:
+            # Format: DTE,IsCall,Strike,OI,IV,FlowDir,Ticker
+            opt_payloads.append(
+                f"{opt['dte']:.6f},{opt['type']},{opt['strike']},{opt['oi']},"
+                f"{opt['iv']:.4f},{opt['flow_dir']},{opt['ticker']}"
+            )
+        
+        # Merge all into one raw string payload
+        payload = header + "|" + "|".join(opt_payloads)
+        
+        # Connect to NT8 TCP Listener and send the entire payload
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2.0)
+            sock.connect((TCP_IP, TCP_PORT))
+            sock.sendall(payload.encode('utf-8'))
             
-            double liveEsPrice = Close[0];
+    except ConnectionRefusedError:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] TCP Target Refused (Is NinjaTrader listening on port {TCP_PORT}?)")
+    except Exception as e:
+        print(f"TCP Transmission Failure: {e}")
+
+# --- DATA AGGREGATION PIPELINE ---
+def fetch_and_send_data(tier='fast'):
+    global history_state
+    try:
+        prune_history_state()
+        now_ny = datetime.now(NY_TZ)
+        timestamp = now_ny.strftime('%H:%M:%S')
+        print(f"[{timestamp}] Executing {tier.upper()} scan...")
+        
+        spot = get_latest_price(TICKER)
+        spy_spot = get_latest_price(SPY_TICKER)
+        fut = get_latest_price(FUTURES_TICKER)
+        
+        if spot == 0 or spy_spot == 0: return None, None
+
+        basis_ratio = fut / spot if (spot > 0 and fut > 0) else 1.0
+        
+        ticker_spx = yf.Ticker(TICKER)
+        ticker_spy = yf.Ticker(SPY_TICKER)
+        expirations = ticker_spx.options
+        if not expirations: return None, None
+
+        selected_exps = []
+        for exp in expirations:
+            exp_date = datetime.strptime(exp, '%Y-%m-%d').replace(hour=16, minute=0, second=0, tzinfo=NY_TZ)
+            days = (exp_date - now_ny).total_seconds() / 86400.0
+            if tier == 'fast' and days <= 1.5: selected_exps.append(exp)
+            elif tier == 'medium' and 1 < days <= 14: selected_exps.append(exp)
+            elif tier == 'slow' and days > 14: selected_exps.append(exp)
+            elif tier == 'ui' and days <= 35: selected_exps.append(exp) 
+
+        chains_spx = {}
+        chains_spy = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures_spx = {executor.submit(fetch_chain_concurrently, ticker_spx, exp): exp for exp in selected_exps}
+            futures_spy = {executor.submit(fetch_chain_concurrently, ticker_spy, exp): exp for exp in selected_exps}
             
-            if (Math.Abs(liveEsPrice - lastCalcPrice) < 0.25 && (DateTime.Now - lastCalcTime).TotalMilliseconds < 250)
-                return;
-                
-            lastCalcPrice = liveEsPrice;
-            lastCalcTime = DateTime.Now;
+            for future in as_completed(futures_spx):
+                exp_key, chain = future.result()
+                if chain: chains_spx[exp_key] = chain
+            for future in as_completed(futures_spy):
+                exp_key, chain = future.result()
+                if chain: chains_spy[exp_key] = chain
 
-            GexSnapshot snap;
-            lock (dataLock) { snap = latestSnapshot; }
+        last_valid_coc_spx = RISK_FREE_RATE - 0.014
+        parsed_for_ui = [] 
 
-            // Lock the visual basis permanently to the very first snapshot received
-            if (anchoredBasis == 0 && snap.BasisRatio > 0)
-                anchoredBasis = snap.BasisRatio;
-
-            // Use the live basis for accurate mathematical moneyness
-            double mathBasis = snap.BasisRatio > 0 ? snap.BasisRatio : 1.0;
-            double nativeSpxSpot = liveEsPrice / mathBasis;
-            double r = snap.RiskFreeRate;
-            double q = snap.DividendYield;
+        # Process chains
+        for exp in sorted(selected_exps):
+            T = calc_trading_T(datetime.strptime(exp, '%Y-%m-%d').replace(hour=16, minute=0, second=0, tzinfo=NY_TZ), now_ny)
             
-            Dictionary<double, double> tempNetGex = new Dictionary<double, double>();
-
-            foreach (var opt in snap.Options)
-            {
-                if (DisplayMode == GexDisplayMode.CallGexOnly && !opt.IsCall) continue;
-                if (DisplayMode == GexDisplayMode.PutGexOnly && opt.IsCall) continue;
-
-                double equivalentStrike = opt.Ticker == "SPY" ? opt.Strike * 10.0 : opt.Strike;
+            # SPX Processing
+            if exp in chains_spx:
+                chain = chains_spx[exp]
                 
-                // USE ANCHORED BASIS: Ensures visually flat lines on the ES chart
-                double chartStrike = equivalentStrike * (anchoredBasis > 0 ? anchoredBasis : 1.0);
-                
-                if (opt.DTE <= 0.0001) continue; 
+                dividend_yield = 0.014
+                b_exp = RISK_FREE_RATE - dividend_yield 
+                last_valid_coc_spx = b_exp
 
-                double adjustedIV = GetShiftedIV(opt.IV, nativeSpxSpot, snap.SnapshotSpot);
-                double gamma = CalculateExactGamma(nativeSpxSpot, equivalentStrike, opt.DTE, adjustedIV, r, q);
-                double gex = gamma * opt.OI * nativeSpxSpot * nativeSpxSpot;
-
-                if (opt.Ticker == "SPY") gex /= 10.0;
-
-                if (!tempNetGex.ContainsKey(chartStrike)) tempNetGex[chartStrike] = 0;
-                if (opt.IsCall) tempNetGex[chartStrike] += gex;
-                else tempNetGex[chartStrike] -= gex;
-            }
-
-            double currentMaxGex = tempNetGex.Values.Select(Math.Abs).DefaultIfEmpty(0.0001).Max();
-
-            lock (historyLock)
-            {
-                if (gexHistory.Count > 0)
-                {
-                    var last = gexHistory[gexHistory.Count - 1];
+                for opt_type, df in [('1', chain.calls), ('0', chain.puts)]:
+                    if 'openInterest' in df.columns:
+                        df = df[df['openInterest'] > 0]
+                    else: continue
+                    df = df[(df['strike'] > spot * 0.85) & (df['strike'] < spot * 1.15)]
+                    is_call = (opt_type == '1')
+                    if df.empty: continue
                     
-                    if (last.StartBar == CurrentBar)
-                    {
-                        last.Profile = tempNetGex;
-                        last.MaxGex = currentMaxGex;
-                    }
-                    else
-                    {
-                        last.EndBar = CurrentBar;
-                        
-                        gexHistory.Add(new GexRenderSnapshot
-                        {
-                            StartBar = CurrentBar,
-                            EndBar = -1,
-                            BasisRatio = anchoredBasis, // Use anchored basis
-                            Profile = tempNetGex,
-                            MaxGex = currentMaxGex
-                        });
-                    }
-                }
-                else
-                {
-                    gexHistory.Add(new GexRenderSnapshot
-                    {
-                        StartBar = CurrentBar,
-                        EndBar = -1,
-                        BasisRatio = anchoredBasis, // Use anchored basis
-                        Profile = tempNetGex,
-                        MaxGex = currentMaxGex
-                    });
-                }
+                    bids, asks, lasts = df['bid'].values, df['ask'].values, df['lastPrice'].values
+                    prices = np.where((bids > 0) & (asks > 0), (bids + asks) / 2.0, lasts)
+                    df['price'] = np.nan_to_num(prices)
+                    
+                    strikes = df['strike'].values
+                    prices_arr = df['price'].values
+                    vols = df.get('volume', pd.Series(0.0, index=df.index)).fillna(0.0).values
+                    ois = df['openInterest'].values
+                    yf_ivs = df.get('impliedVolatility', pd.Series(0.20, index=df.index)).fillna(0.20).values
+                    yf_ivs = np.where(yf_ivs == 0, 0.20, yf_ivs)
 
-                if (gexHistory.Count > HistoryLimit)
-                    gexHistory.RemoveAt(0); 
-            }
-        }
+                    final_ivs = []
+                    for k, p, fb in zip(strikes, prices_arr, yf_ivs):
+                        if 0.01 < fb < 3.0:
+                            final_ivs.append(fb) 
+                        else:
+                            calc_iv = calculate_implied_iv_brent(spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fallback_iv=0.20)
+                            final_ivs.append(calc_iv)
 
-        #region Rendering Logic (Hardware-Accelerated)
-        public override void OnRenderTargetChanged()
-        {
-            DisposeBrushes();
-            if (RenderTarget != null)
-            {
-                for (int i = 0; i < 256; i++)
-                {
-                    System.Windows.Media.Color pc = System.Windows.Media.Color.FromRgb((byte)(10+(0-10)*(i/255.0)), (byte)(20+(200-20)*(i/255.0)), (byte)(40+(255-40)*(i/255.0)));
-                    positiveBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(pc.R, pc.G, pc.B)) { Opacity = 0.65f };
-                    System.Windows.Media.Color nc = System.Windows.Media.Color.FromRgb((byte)(40+(255-40)*(i/255.0)), (byte)(10+(100-10)*(i/255.0)), (byte)(10+(0-10)*(i/255.0)));
-                    negativeBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(nc.R, nc.G, nc.B)) { Opacity = 0.65f };
-                }
-            }
-        }
+                    exact_ivs = smooth_volatility_smile(strikes, final_ivs)
 
-        private void DisposeBrushes()
-        {
-            if (positiveBrushes != null) for (int i = 0; i < 256; i++) { if (positiveBrushes[i] != null) positiveBrushes[i].Dispose();
-            if (negativeBrushes[i] != null) negativeBrushes[i].Dispose(); }
-        }
+                    flow_dirs = []
+                    for strike, price, vol in zip(strikes, prices_arr, vols):
+                        uid = f"{exp}_{opt_type}_{strike}"
+                        flow_dir = 0
+                        if uid in history_state:
+                            prev_price, prev_vol = history_state[uid]
+                            if vol > prev_vol:
+                                if price > prev_price: flow_dir = 1
+                                elif price < prev_price: flow_dir = -1
+                        history_state[uid] = (price, vol)
+                        flow_dirs.append(flow_dir)
 
-        protected override void OnRender(ChartControl cc, ChartScale cs)
-        {
-            if (Bars == null || positiveBrushes == null || positiveBrushes[0] == null) return;
+                    for strike, price, vol, oi, exact_iv, flow_dir in zip(strikes, prices_arr, vols, ois, exact_ivs, flow_dirs):
+                        parsed_for_ui.append({
+                            'exp': exp, 'dte': T, 'type': opt_type, 
+                            'strike': strike, 'oi': oi, 'iv': exact_iv, 'vol': vol,
+                            'b': b_exp, 'ticker': 'SPX', 'flow_dir': flow_dir
+                        })
+
+            # SPY Processing
+            if exp in chains_spy:
+                chain = chains_spy[exp]
+                
+                dividend_yield = 0.012
+                b_exp = RISK_FREE_RATE - dividend_yield
+
+                for opt_type, df in [('1', chain.calls), ('0', chain.puts)]:
+                    if 'openInterest' in df.columns:
+                        df = df[df['openInterest'] > 0]
+                    else: continue
+                    df = df[(df['strike'] > spy_spot * 0.85) & (df['strike'] < spy_spot * 1.15)]
+                    is_call = (opt_type == '1')
+                    if df.empty: continue
+                    
+                    bids, asks, lasts = df['bid'].values, df['ask'].values, df['lastPrice'].values
+                    prices = np.where((bids > 0) & (asks > 0), (bids + asks) / 2.0, lasts)
+                    df['price'] = np.nan_to_num(prices)
+                    
+                    strikes = df['strike'].values
+                    prices_arr = df['price'].values
+                    vols = df.get('volume', pd.Series(0.0, index=df.index)).fillna(0.0).values
+                    ois = df['openInterest'].values
+                    yf_ivs = df.get('impliedVolatility', pd.Series(0.20, index=df.index)).fillna(0.20).values
+                    yf_ivs = np.where(yf_ivs == 0, 0.20, yf_ivs)
+
+                    final_ivs = []
+                    for k, p, fb in zip(strikes, prices_arr, yf_ivs):
+                        if 0.01 < fb < 3.0:
+                            final_ivs.append(fb) 
+                        else:
+                            calc_iv = calculate_implied_iv_brent(spy_spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fallback_iv=0.20)
+                            final_ivs.append(calc_iv)
+
+                    exact_ivs = smooth_volatility_smile(strikes, final_ivs)
+
+                    flow_dirs = []
+                    for strike, price, vol in zip(strikes, prices_arr, vols):
+                        uid = f"{exp}_{opt_type}_{strike}"
+                        flow_dir = 0
+                        if uid in history_state:
+                            prev_price, prev_vol = history_state[uid]
+                            if vol > prev_vol:
+                                if price > prev_price: flow_dir = 1
+                                elif price < prev_price: flow_dir = -1
+                        history_state[uid] = (price, vol)
+                        flow_dirs.append(flow_dir)
+
+                    for strike, price, vol, oi, exact_iv, flow_dir in zip(strikes, prices_arr, vols, ois, exact_ivs, flow_dirs):
+                        parsed_for_ui.append({
+                            'exp': exp, 'dte': T, 'type': opt_type, 
+                            'strike': strike, 'oi': oi, 'iv': exact_iv, 'vol': vol,
+                            'b': b_exp, 'ticker': 'SPY', 'flow_dir': flow_dir
+                        })
+
+        if not parsed_for_ui: return None, None
+
+        # SEND OVER TCP
+        header_coc = last_valid_coc_spx if last_valid_coc_spx is not None else RISK_FREE_RATE - 0.014
+        transmit_tcp_payload(spot, basis_ratio, header_coc, parsed_for_ui)
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] TCP Broadcast Completed.")
+        return {'time': timestamp, 'spot': spot}, parsed_for_ui
+
+    except Exception as e:
+        print(f"Error in fetcher: {e}")
+        return None, None
+
+# =========================================================================================
+# ========================= HIGH-PERFORMANCE DEV UI BLOCK =================================
+# =========================================================================================
+
+def calc_gamma_vectorized(S, K_array, T_array, v_array, b_array, r=RISK_FREE_RATE):
+    T_safe = np.clip(T_array, 1e-5, None)
+    v_safe = np.clip(v_array, 1e-3, None)
+    
+    d1 = (np.log(S / K_array) + (b_array + 0.5 * v_safe**2) * T_safe) / (v_safe * np.sqrt(T_safe))
+    norm_pdf = np.exp(-d1**2 / 2.0) / np.sqrt(2.0 * np.pi)
+    
+    gamma = (np.exp((b_array - r) * T_safe) * norm_pdf) / (S * v_safe * np.sqrt(T_safe))
+    return np.nan_to_num(gamma, nan=0.0)
+
+class DebugGEXUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Institutional Live GEX Viewer")
+        self.root.geometry("1300x850")
+        self.root.configure(bg='#1c1c1c')
+        plt.style.use('dark_background')
+
+        self.history = {} 
+        self.timestamps = []
+        self.current_idx = 0
+        
+        self.include_0dte = True
+        self.show_walls = False
+        self.show_abs_gex = False
+        self.show_profiles = False
+        self.show_combo = True 
+
+        self.custom_xlim = None
+        self.custom_ylim = None
+        self.is_dragging = False
+        self.last_mouse_x = None
+        self.last_mouse_y = None
+
+        self.setup_ui()
+        self.root.after(1000, self.fetch_loop)
+
+    def setup_ui(self):
+        self.fig, self.ax = plt.subplots(figsize=(12, 7))
+        self.fig.subplots_adjust(left=0.08, right=0.95, top=0.92, bottom=0.08)
+        self.fig.patch.set_facecolor('#1c1c1c')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.canvas.mpl_connect('scroll_event', self.on_scroll)
+        self.canvas.mpl_connect('button_press_event', self.on_press)
+        self.canvas.mpl_connect('button_release_event', self.on_release)
+        self.canvas.mpl_connect('motion_notify_event', self.on_motion)
+
+        btm_frame = tk.Frame(self.root, bg='#2d2d2d')
+        btm_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5) 
+
+        self.slider_var = tk.IntVar()
+        self.slider = ttk.Scale(btm_frame, from_=0, to=0, variable=self.slider_var, command=self.on_slider)
+        self.slider.pack(fill=tk.X, padx=20, pady=5)
+
+        ctrl_box = tk.Frame(btm_frame, bg='#2d2d2d')
+        ctrl_box.pack(pady=5)
+
+        tk.Button(ctrl_box, text="⏮", command=self.prev_frame, bg="#444", fg="white").pack(side=tk.LEFT, padx=5)
+        self.lbl_time = tk.Label(ctrl_box, text="Waiting for data...", bg='#2d2d2d', fg="cyan", font=("Consolas", 12))
+        self.lbl_time.pack(side=tk.LEFT, padx=15)
+        tk.Button(ctrl_box, text="⏭", command=self.next_frame, bg="#444", fg="white").pack(side=tk.LEFT, padx=5)
+
+        self.btn_filter = tk.Button(ctrl_box, text="✅ 0DTE Included", command=self.toggle_0dte, bg="#006600", fg="white")
+        self.btn_filter.pack(side=tk.LEFT, padx=10)
+
+        self.btn_combo = tk.Button(ctrl_box, text="🍔 Combo GEX (SPX+SPY): ON", command=self.toggle_combo, bg="#006600", fg="white")
+        self.btn_combo.pack(side=tk.LEFT, padx=10)
+
+        self.btn_walls = tk.Button(ctrl_box, text="🧱 Walls: OFF", command=self.toggle_walls, bg="#444", fg="white")
+        self.btn_walls.pack(side=tk.LEFT, padx=5)
+
+        self.btn_abs = tk.Button(ctrl_box, text="📈 Abs GEX: OFF", command=self.toggle_abs_gex, bg="#444", fg="white")
+        self.btn_abs.pack(side=tk.LEFT, padx=5)
+
+        self.btn_profiles = tk.Button(ctrl_box, text="🏔️ Profiles: OFF", command=self.toggle_profiles, bg="#444", fg="white")
+        self.btn_profiles.pack(side=tk.LEFT, padx=5)
+
+        self.btn_reset = tk.Button(ctrl_box, text="🔄 Reset View", command=self.reset_view, bg="#0055aa", fg="white")
+        self.btn_reset.pack(side=tk.LEFT, padx=20)
+
+        stats_frame = tk.Frame(btm_frame, bg='#1a1a1a', bd=1, relief="ridge")
+        stats_frame.pack(fill=tk.X, padx=20, pady=5)
+        self.lbl_stats = tk.Label(stats_frame, text="📊 Statistics Calculating...", bg='#1a1a1a', fg="gold", font=("Arial", 11, "bold"))
+        self.lbl_stats.pack(pady=2)
+
+    def on_scroll(self, event):
+        if event.inaxes == self.ax:
+            scale_factor = 0.9 if event.button == 'up' else 1.1 
+            xdata, ydata = event.xdata, event.ydata
+            if xdata is None or ydata is None: return
+            xlim, ylim = self.ax.get_xlim(), self.ax.get_ylim()
+            new_width = (xlim[1] - xlim[0]) * scale_factor
+            new_height = (ylim[1] - ylim[0]) * scale_factor
+            relx = (xlim[1] - xdata) / (xlim[1] - xlim[0])
+            rely = (ylim[1] - ydata) / (ylim[1] - ylim[0])
+            self.custom_xlim = [xdata - new_width * (1 - relx), xdata + new_width * relx]
+            self.custom_ylim = [ydata - new_height * (1 - rely), ydata + new_height * rely]
+            self.ax.set_xlim(self.custom_xlim)
+            self.ax.set_ylim(self.custom_ylim)
+            self.canvas.draw_idle()
+
+    def on_press(self, event):
+        if event.button == 1 and event.inaxes == self.ax:
+            self.is_dragging = True
+            self.last_mouse_x, self.last_mouse_y = event.x, event.y
+
+    def on_motion(self, event):
+        if self.is_dragging and event.inaxes == self.ax:
+            inv = self.ax.transData.inverted()
+            p1 = inv.transform((self.last_mouse_x, self.last_mouse_y))
+            p2 = inv.transform((event.x, event.y))
+            dx_data, dy_data = p2[0] - p1[0], p2[1] - p1[1]
+            xlim, ylim = self.ax.get_xlim(), self.ax.get_ylim()
+            self.custom_xlim = [xlim[0] - dx_data, xlim[1] - dx_data]
+            self.custom_ylim = [ylim[0] - dy_data, ylim[1] - dy_data]
+            self.ax.set_xlim(self.custom_xlim)
+            self.ax.set_ylim(self.custom_ylim)
+            self.last_mouse_x, self.last_mouse_y = event.x, event.y
+            self.canvas.draw_idle()
+
+    def on_release(self, event):
+        self.is_dragging = False
+
+    def reset_view(self):
+        self.custom_xlim, self.custom_ylim = None, None
+        self.render_plot()
+
+    def toggle_0dte(self):
+        self.include_0dte = not self.include_0dte
+        self.btn_filter.config(text="✅ 0DTE Included" if self.include_0dte else "❌ 0DTE Excluded", bg="#006600" if self.include_0dte else "#660000")
+        if self.timestamps: self.render_plot()
+
+    def toggle_combo(self):
+        self.show_combo = not self.show_combo
+        self.btn_combo.config(
+            text="🍔 Combo GEX (SPX+SPY): ON" if self.show_combo else "🍔 Combo GEX (SPX+SPY): OFF",
+            bg="#006600" if self.show_combo else "#660000"
+        )
+        if self.timestamps: self.render_plot()
+
+    def toggle_walls(self):
+        self.show_walls = not self.show_walls
+        self.btn_walls.config(text="🧱 Walls: ON" if self.show_walls else "🧱 Walls: OFF", bg="#006600" if self.show_walls else "#444")
+        if self.timestamps: self.render_plot()
+
+    def toggle_abs_gex(self):
+        self.show_abs_gex = not self.show_abs_gex
+        self.btn_abs.config(text="📈 Abs GEX: ON" if self.show_abs_gex else "📈 Abs GEX: OFF", bg="#006600" if self.show_abs_gex else "#444")
+        if self.timestamps: self.render_plot()
+
+    def toggle_profiles(self):
+        self.show_profiles = not self.show_profiles
+        self.btn_profiles.config(text="🏔️ Profiles: ON" if self.show_profiles else "🏔️ Profiles: OFF", bg="#006600" if self.show_profiles else "#444")
+        if self.timestamps: self.render_plot()
+
+    def fetch_loop(self):
+        threading.Thread(target=self.run_engine_and_process, daemon=True).start()
+        self.root.after(60000, self.fetch_loop)
+
+    def run_engine_and_process(self):
+        header, options = fetch_and_send_data('ui') 
+        if not header or not options: return
+        ts = header['time']
+        self.history[ts] = {'spot': header['spot'], 'options': options}
+        if ts not in self.timestamps: self.timestamps.append(ts)
+        self.root.after(0, self.sync_ui_state)
+
+    def sync_ui_state(self):
+        self.slider.config(to=max(0, len(self.timestamps)-1))
+        if self.current_idx >= len(self.timestamps) - 2:
+            self.current_idx = len(self.timestamps) - 1
+            self.slider_var.set(self.current_idx)
+        self.render_plot()
+
+    def on_slider(self, val):
+        self.current_idx = int(float(val))
+        self.render_plot()
+
+    def prev_frame(self):
+        if self.current_idx > 0:
+            self.current_idx -= 1
+            self.slider_var.set(self.current_idx)
+            self.render_plot()
+
+    def next_frame(self):
+        if self.current_idx < len(self.timestamps) - 1:
+            self.current_idx += 1
+            self.slider_var.set(self.current_idx)
+            self.render_plot()
+
+    def render_plot(self):
+        if not self.timestamps: return
+        
+        ts = self.timestamps[self.current_idx]
+        data = self.history[ts]
+        spot = data['spot']
+        
+        df = pd.DataFrame(data['options'])
+        if df.empty: return
+        
+        if not self.show_combo:
+            df = df[df['ticker'] == 'SPX']
             
-            List<GexRenderSnapshot> renderHistory;
-            lock(historyLock) { renderHistory = new List<GexRenderSnapshot>(gexHistory); }
-            if (renderHistory.Count == 0) return;
+        today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
+        df['is_0dte'] = df['exp'] == today_str
+        
+        if not self.include_0dte:
+            df = df[~df['is_0dte']]
+            if df.empty:
+                self.ax.clear()
+                self.canvas.draw()
+                return
 
-            RenderTarget.AntialiasMode = SharpDX.Direct2D1.AntialiasMode.Aliased;
-            double minP = cs.MinValue, maxP = cs.MaxValue;
+        is_spy = df['ticker'] == 'SPY'
+        df['spot_val'] = np.where(is_spy, spot / 10.0, spot)
+        df['strike_val'] = df['strike'].values
+        
+        df['gamma'] = calc_gamma_vectorized(
+            df['spot_val'].values, 
+            df['strike_val'].values, 
+            df['dte'].values, 
+            df['iv'].values, 
+            df['b'].values
+        )
+        
+        df['base_gex'] = df['gamma'] * df['oi'] * (df['spot_val'] ** 2)
+        df['scaled_gex'] = np.where(is_spy, df['base_gex'] / 10.0, df['base_gex'])
+        df['plot_strike'] = np.where(is_spy, df['strike_val'] * 10.0, df['strike_val'])
+
+        df['actual_gex'] = np.where(df['type'] == '1', df['scaled_gex'], -df['scaled_gex'])
+        df['abs_actual_gex'] = np.abs(df['actual_gex'])
+
+        # Aggregate Statistics
+        vol_0dte = df[df['is_0dte']]['vol'].sum()
+        vol_other = df[~df['is_0dte']]['vol'].sum()
+        abs_gex_0dte = df[df['is_0dte']]['abs_actual_gex'].sum()
+        abs_gex_other = df[~df['is_0dte']]['abs_actual_gex'].sum()
+
+        total_vol = vol_0dte + vol_other
+        pct_0dte = (vol_0dte / total_vol * 100) if total_vol > 0 else 0
+        
+        stats_msg = (
+            f"📊 Range Exposure (per 1% move):   "
+            f"0DTE Vol: {pct_0dte:.1f}%   |   "
+            f"0DTE Size: ${abs_gex_0dte / 1e9:.2f}B   |   "
+            f">0DTE Size: ${abs_gex_other / 1e9:.2f}B"
+        )
+        self.lbl_stats.config(text=stats_msg)
+
+        # STABLE NON-LAMBDA GROUPBY AGGREGATIONS
+        net_gex = df.groupby('plot_strike')['actual_gex'].sum()
+        abs_gex = df.groupby('plot_strike')['abs_actual_gex'].sum()
+        call_gex = df[df['type'] == '1'].groupby('plot_strike')['abs_actual_gex'].sum()
+        put_gex = df[df['type'] == '0'].groupby('plot_strike')['abs_actual_gex'].sum()
+
+        agg_df = pd.DataFrame({
+            'net_gex': net_gex, 
+            'abs_gex': abs_gex,
+            'call_gex': call_gex, 
+            'put_gex': put_gex
+        }).fillna(0).reset_index()
+
+        self.ax.clear()
+
+        strikes = agg_df['plot_strike'].values
+        net_gex_vals = agg_df['net_gex'].values / 1e9
+        abs_gex_vals = agg_df['abs_gex'].values / 1e9
+
+        colors = ['#ff4c4c' if val < 0 else '#4cff4c' for val in net_gex_vals]
+        self.ax.barh(strikes, net_gex_vals, color=colors, height=4.0, alpha=0.8, label="Net GEX")
+        
+        if self.show_profiles:
+            call_vals = agg_df['call_gex'].values / 1e9
+            put_vals = agg_df['put_gex'].values / 1e9
             
-            float barWidth = (float)cc.Properties.BarDistance;
+            self.ax.plot(call_vals, strikes, color='#00ff00', linewidth=1.5, alpha=0.7)
+            self.ax.fill_betweenx(strikes, 0, call_vals, color='#00ff00', alpha=0.2, label='Call Profile (Abs)')
+            
+            self.ax.plot(put_vals, strikes, color='#ff0000', linewidth=1.5, alpha=0.7)
+            self.ax.fill_betweenx(strikes, 0, put_vals, color='#ff0000', alpha=0.2, label='Put Profile (Abs)')
 
-            foreach (var snap in renderHistory)
-            {
-                int startIdx = snap.StartBar;
-                int endIdx = snap.EndBar == -1 ? ChartBars.ToIndex + 1 : snap.EndBar;
+        if self.show_abs_gex:
+            self.ax.plot(abs_gex_vals, strikes, color='#ff00ff', linewidth=2.0, linestyle='-', label='Absolute Net Gamma')
 
-                if (endIdx < ChartBars.FromIndex || startIdx > ChartBars.ToIndex + 1) continue;
+        self.ax.axhline(y=spot, color='gray', linestyle='-', linewidth=0.8, label=f'Spot: {spot:.2f}')
 
-                float x1 = cc.GetXByBarIndex(ChartBars, startIdx) - (barWidth / 2f);
-                float x2 = cc.GetXByBarIndex(ChartBars, endIdx) - (barWidth / 2f);
-                
-                if (snap.EndBar == -1) 
-                    x2 = cc.CanvasRight;
+        if self.show_walls and not agg_df.empty:
+            call_wall_strike = agg_df.loc[agg_df['net_gex'].idxmax(), 'plot_strike']
+            put_wall_strike = agg_df.loc[agg_df['net_gex'].idxmin(), 'plot_strike']
+            
+            if agg_df['net_gex'].max() > 0:
+                self.ax.axhline(y=call_wall_strike, color='#00ff00', linestyle=':', linewidth=2, label=f'Call Wall: {call_wall_strike}')
+            if agg_df['net_gex'].min() < 0:
+                self.ax.axhline(y=put_wall_strike, color='#ff0000', linestyle=':', linewidth=2, label=f'Put Wall: {put_wall_strike}')
 
-                float w = x2 - x1;
-                if (w <= 0) continue; 
+        title_text = f"S&P 500 Gamma Exposure - Time: {ts}"
+        if not self.include_0dte: title_text += " [0DTE EXCLUDED]"
+        if self.show_combo: title_text += " [SPX + SPY CONSOLIDATED]"
+        
+        self.ax.set_title(title_text, color='white', fontweight='bold')
+        self.ax.set_xlabel("Dealer Exposure per 1% Move ($ Billions)", color='white')
+        self.ax.set_ylabel("S&P 500 Strike Scale", color='white')
+        self.ax.tick_params(colors='white')
+        self.ax.grid(True, color='#444', alpha=0.3)
+        self.ax.legend(loc="upper right", facecolor='#333', labelcolor='white')
+        
+        if self.custom_xlim and self.custom_ylim:
+            self.ax.set_xlim(self.custom_xlim)
+            self.ax.set_ylim(self.custom_ylim)
 
-                float strikeHalfStep = (float)(2.5 * snap.BasisRatio);
+        self.lbl_time.config(text=f"Time: {ts}")
+        self.canvas.draw()
 
-                foreach (var kvp in snap.Profile)
-                {
-                    if (kvp.Key > maxP + 10 || kvp.Key < minP - 10) continue;
-                    
-                    double ratio = Math.Abs(kvp.Value) / snap.MaxGex;
-                    if (ratio < (CutoffPercent / 100.0)) continue;
-                    
-                    float yt = cs.GetYByValue(kvp.Key + strikeHalfStep);
-                    float yb = cs.GetYByValue(kvp.Key - strikeHalfStep);
-                    
-                    SharpDX.RectangleF rect = new SharpDX.RectangleF(x1, Math.Min(yt, yb), w, Math.Abs(yb - yt));
-                    
-                    int colorIndex = Math.Max(0, Math.Min(255, (int)(ratio * 255)));
-                    RenderTarget.FillRectangle(rect, kvp.Value >= 0 ? positiveBrushes[colorIndex] : negativeBrushes[colorIndex]);
-                }
-            }
-        }
-        #endregion
-    }
-}
+def launch_system():
+    root = tk.Tk()
+    app = DebugGEXUI(root)
+    print("--- Institutional TCP GEX Engine V3 + UI Started ---")
+    root.mainloop()
+
+if __name__ == "__main__":
+    launch_system()
