@@ -146,19 +146,13 @@ def smooth_volatility_smile(strikes, ivs):
     except Exception:
         return ivs
 
-# --- DECOUPLED UDP TRANSMISSION SERVER (Claude's Request) ---
+# --- DECOUPLED UDP TRANSMISSION SERVER ---
 def transmit_udp_payload(spot, basis_ratio, vix, cost_of_carry, options_list):
-    """
-    Standardized, isolated UDP packaging and transmission function.
-    Aggregates headers and serializes raw options vectors into chunks.
-    """
     try:
         timestamp = datetime.now(NY_TZ).timestamp()
         
-        # Header Format: Timestamp,BasisRatio,VIX,Spot,CostOfCarry
         header = f"{timestamp},{basis_ratio:.6f},{vix:.4f},{spot:.2f},{cost_of_carry:.6f}"
         
-        # Options format: DTE,IsCall,Strike,OI,IV,FlowDir,Carry,Ticker
         opt_payloads = []
         for opt in options_list:
             opt_payloads.append(
@@ -168,7 +162,6 @@ def transmit_udp_payload(spot, basis_ratio, vix, cost_of_carry, options_list):
         
         payload = header + "|" + "|".join(opt_payloads)
         
-        # Chunking to prevent UDP buffer overflows (> 60KB payload)
         chunk_size = 50000 
         for i in range(0, len(payload), chunk_size):
             sock.sendto(payload[i:i+chunk_size].encode(), (UDP_IP, UDP_PORT))
@@ -224,7 +217,6 @@ def fetch_and_send_data(tier='fast'):
         last_valid_coc_spy = None
         parsed_for_ui = [] 
 
-        # Process chains
         for exp in sorted(selected_exps):
             T = calc_trading_T(datetime.strptime(exp, '%Y-%m-%d').replace(hour=16, minute=0, second=0, tzinfo=NY_TZ), now_ny)
             
@@ -260,7 +252,6 @@ def fetch_and_send_data(tier='fast'):
                     ]
                     exact_ivs = smooth_volatility_smile(strikes, exact_ivs)
 
-                    # Dynamic flow calculation
                     flow_dirs = []
                     for strike, price, vol in zip(strikes, prices_arr, vols):
                         uid = f"{exp}_{opt_type}_{strike}"
@@ -333,7 +324,6 @@ def fetch_and_send_data(tier='fast'):
 
         if not parsed_for_ui: return None, None
 
-        # BROADCAST DATA OVER SOCKET IN DEDICATED FUNCTION
         header_coc = last_valid_coc_spx if last_valid_coc_spx is not None else 0.0
         transmit_udp_payload(spot, basis_ratio, vix, header_coc, parsed_for_ui)
         
@@ -564,6 +554,8 @@ class DebugGEXUI:
                 return
 
         is_spy = df['ticker'] == 'SPY'
+        
+        # Spot/Strike proxies for calculating SPY Option Greeks
         df['spot_val'] = np.where(is_spy, spot / 10.0, spot)
         df['strike_val'] = df['strike'].values
         
@@ -575,8 +567,17 @@ class DebugGEXUI:
             df['b'].values
         )
         
+        # =========================================================================
+        # THE FIX: SPX and SPY contracts both represent a 100x multiplier. 
+        # Therefore, standard Gamma * OI * Spot^2 yields the EXACT absolute dollar 
+        # exposure per 1% move for both assets naturally. No extra division by 10 is needed!
+        # =========================================================================
+        
+        # Raw Absolute Dollar Value Gamma Exposure per 1% move
         df['base_gex'] = df['gamma'] * df['oi'] * (df['spot_val'] ** 2)
-        df['scaled_gex'] = np.where(is_spy, df['base_gex'] / 10.0, df['base_gex'])
+        df['scaled_gex'] = df['base_gex']  # <-- Bug fixed here: removed / 10.0
+        
+        # Scale the SPY strikes up by 10x ONLY for visual plotting on unified axis
         df['plot_strike'] = np.where(is_spy, df['strike_val'] * 10.0, df['strike_val'])
 
         df['actual_gex'] = np.where(df['type'] == '1', df['scaled_gex'], -df['scaled_gex'])
