@@ -1,3 +1,5 @@
+# --- START OF FILE GEX engine V3.py ---
+
 import pandas as pd
 import yfinance as yf
 import time
@@ -90,38 +92,6 @@ def calculate_implied_iv_brent(S, K, T, r, b, market_price, is_call, fallback_iv
     except (ValueError, RuntimeError):
         return fallback_iv 
 
-def calculate_cost_of_carry(spot, calls, puts, T):
-    try:
-        if calls.empty or puts.empty: return None
-        
-        calls = calls[(calls['bid'] > 0) & (calls['ask'] > 0)].copy()
-        puts = puts[(puts['bid'] > 0) & (puts['ask'] > 0)].copy()
-        if calls.empty or puts.empty: return None
-
-        calls['mid'] = (calls['bid'] + calls['ask']) / 2.0
-        puts['mid'] = (puts['bid'] + puts['ask']) / 2.0
-
-        calls['abs_diff'] = abs(calls['strike'] - spot)
-        atm_strike = calls.loc[calls['abs_diff'].idxmin()]['strike']
-        
-        atm_call_rows = calls[calls['strike'] == atm_strike]
-        atm_put_rows = puts[puts['strike'] == atm_strike]
-        
-        if atm_call_rows.empty or atm_put_rows.empty: return None
-        
-        atm_call = atm_call_rows.iloc[0]['mid']
-        atm_put = atm_put_rows.iloc[0]['mid']
-        
-        if pd.isna(atm_call) or pd.isna(atm_put): return None
-        
-        implied_forward = atm_strike + math.exp(RISK_FREE_RATE * T) * (atm_call - atm_put)
-        if implied_forward <= 0: return None
-        
-        cost_of_carry = math.log(implied_forward / spot) / T 
-        return max(-0.10, min(cost_of_carry, 0.10)) 
-    except Exception:
-        return None 
-
 def fetch_chain_concurrently(ticker_obj, exp):
     try:
         return exp, ticker_obj.option_chain(exp)
@@ -135,22 +105,19 @@ def prune_history_state():
     for k in stale_keys:
         history_state.pop(k, None)
 
-# --- SKEW / VOLATILITY SMILE SMOOTHING ---
+# --- SKEW / VOLATILITY SMILE SMOOTHING (FIXED: ROLLING MEDIAN) ---
 def smooth_volatility_smile(strikes, ivs):
-    if len(strikes) < 4:
+    # Median filter aggressively kills data spikes from YF without warping the curve
+    if len(ivs) < 5:
         return ivs
-    try:
-        coefs = np.polyfit(strikes, ivs, 3)
-        smoothed = np.polyval(coefs, strikes)
-        return np.clip(smoothed, 0.01, 3.0).tolist()
-    except Exception:
-        return ivs
+    s = pd.Series(ivs)
+    smoothed = s.rolling(window=5, center=True, min_periods=1).median()
+    return np.clip(smoothed.values, 0.05, 3.0).tolist()
 
 # --- DECOUPLED UDP TRANSMISSION SERVER ---
 def transmit_udp_payload(spot, basis_ratio, vix, cost_of_carry, options_list):
     try:
         timestamp = datetime.now(NY_TZ).timestamp()
-        
         header = f"{timestamp},{basis_ratio:.6f},{vix:.4f},{spot:.2f},{cost_of_carry:.6f}"
         
         opt_payloads = []
@@ -161,7 +128,6 @@ def transmit_udp_payload(spot, basis_ratio, vix, cost_of_carry, options_list):
             )
         
         payload = header + "|" + "|".join(opt_payloads)
-        
         chunk_size = 50000 
         for i in range(0, len(payload), chunk_size):
             sock.sendto(payload[i:i+chunk_size].encode(), (UDP_IP, UDP_PORT))
@@ -213,19 +179,22 @@ def fetch_and_send_data(tier='fast'):
                 exp_key, chain = future.result()
                 if chain: chains_spy[exp_key] = chain
 
-        last_valid_coc_spx = None
-        last_valid_coc_spy = None
+        last_valid_coc_spx = RISK_FREE_RATE - 0.014 # Fallback
         parsed_for_ui = [] 
 
+        # Process chains
         for exp in sorted(selected_exps):
             T = calc_trading_T(datetime.strptime(exp, '%Y-%m-%d').replace(hour=16, minute=0, second=0, tzinfo=NY_TZ), now_ny)
             
             # SPX Processing
             if exp in chains_spx:
                 chain = chains_spx[exp]
-                current_coc = calculate_cost_of_carry(spot, chain.calls, chain.puts, T)
-                if current_coc is not None: last_valid_coc_spx = current_coc
-                b_exp = last_valid_coc_spx if last_valid_coc_spx is not None else 0.0
+                
+                # FIXED: Hardcode structural carry (Risk Free Rate - Dividend Yield)
+                # SPX dividend yield is ~1.4%
+                dividend_yield = 0.014
+                b_exp = RISK_FREE_RATE - dividend_yield 
+                last_valid_coc_spx = b_exp
 
                 for opt_type, df in [('1', chain.calls), ('0', chain.puts)]:
                     if 'openInterest' in df.columns:
@@ -246,12 +215,19 @@ def fetch_and_send_data(tier='fast'):
                     yf_ivs = df.get('impliedVolatility', pd.Series(0.20, index=df.index)).fillna(0.20).values
                     yf_ivs = np.where(yf_ivs == 0, 0.20, yf_ivs)
 
-                    exact_ivs = [
-                        calculate_implied_iv_brent(spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fb)
-                        for k, p, fb in zip(strikes, prices_arr, yf_ivs)
-                    ]
-                    exact_ivs = smooth_volatility_smile(strikes, exact_ivs)
+                    # FIXED: Trust YF's exchange IV first. Only use Brent Solver as fallback.
+                    final_ivs = []
+                    for k, p, fb in zip(strikes, prices_arr, yf_ivs):
+                        if 0.01 < fb < 3.0:
+                            final_ivs.append(fb) # Trust exchange IV
+                        else:
+                            calc_iv = calculate_implied_iv_brent(spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fallback_iv=0.20)
+                            final_ivs.append(calc_iv)
 
+                    # Apply Median Filter
+                    exact_ivs = smooth_volatility_smile(strikes, final_ivs)
+
+                    # Dynamic flow calculation
                     flow_dirs = []
                     for strike, price, vol in zip(strikes, prices_arr, vols):
                         uid = f"{exp}_{opt_type}_{strike}"
@@ -274,9 +250,10 @@ def fetch_and_send_data(tier='fast'):
             # SPY Processing
             if exp in chains_spy:
                 chain = chains_spy[exp]
-                current_coc = calculate_cost_of_carry(spy_spot, chain.calls, chain.puts, T)
-                if current_coc is not None: last_valid_coc_spy = current_coc
-                b_exp = last_valid_coc_spy if last_valid_coc_spy is not None else 0.0
+                
+                # FIXED: Hardcode structural carry for SPY (~1.2% div yield)
+                dividend_yield = 0.012
+                b_exp = RISK_FREE_RATE - dividend_yield
 
                 for opt_type, df in [('1', chain.calls), ('0', chain.puts)]:
                     if 'openInterest' in df.columns:
@@ -297,11 +274,17 @@ def fetch_and_send_data(tier='fast'):
                     yf_ivs = df.get('impliedVolatility', pd.Series(0.20, index=df.index)).fillna(0.20).values
                     yf_ivs = np.where(yf_ivs == 0, 0.20, yf_ivs)
 
-                    exact_ivs = [
-                        calculate_implied_iv_brent(spy_spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fb)
-                        for k, p, fb in zip(strikes, prices_arr, yf_ivs)
-                    ]
-                    exact_ivs = smooth_volatility_smile(strikes, exact_ivs)
+                    # FIXED: Trust YF's exchange IV first.
+                    final_ivs = []
+                    for k, p, fb in zip(strikes, prices_arr, yf_ivs):
+                        if 0.01 < fb < 3.0:
+                            final_ivs.append(fb) 
+                        else:
+                            calc_iv = calculate_implied_iv_brent(spy_spot, k, T, RISK_FREE_RATE, b_exp, p, is_call, fallback_iv=0.20)
+                            final_ivs.append(calc_iv)
+
+                    # Apply Median Filter
+                    exact_ivs = smooth_volatility_smile(strikes, final_ivs)
 
                     flow_dirs = []
                     for strike, price, vol in zip(strikes, prices_arr, vols):
@@ -324,6 +307,7 @@ def fetch_and_send_data(tier='fast'):
 
         if not parsed_for_ui: return None, None
 
+        # BROADCAST DATA OVER SOCKET IN DEDICATED FUNCTION
         header_coc = last_valid_coc_spx if last_valid_coc_spx is not None else 0.0
         transmit_udp_payload(spot, basis_ratio, vix, header_coc, parsed_for_ui)
         
@@ -554,8 +538,6 @@ class DebugGEXUI:
                 return
 
         is_spy = df['ticker'] == 'SPY'
-        
-        # Spot/Strike proxies for calculating SPY Option Greeks
         df['spot_val'] = np.where(is_spy, spot / 10.0, spot)
         df['strike_val'] = df['strike'].values
         
@@ -567,17 +549,8 @@ class DebugGEXUI:
             df['b'].values
         )
         
-        # =========================================================================
-        # THE FIX: SPX and SPY contracts both represent a 100x multiplier. 
-        # Therefore, standard Gamma * OI * Spot^2 yields the EXACT absolute dollar 
-        # exposure per 1% move for both assets naturally. No extra division by 10 is needed!
-        # =========================================================================
-        
-        # Raw Absolute Dollar Value Gamma Exposure per 1% move
         df['base_gex'] = df['gamma'] * df['oi'] * (df['spot_val'] ** 2)
-        df['scaled_gex'] = df['base_gex']  # <-- Bug fixed here: removed / 10.0
-        
-        # Scale the SPY strikes up by 10x ONLY for visual plotting on unified axis
+        df['scaled_gex'] = np.where(is_spy, df['base_gex'] / 10.0, df['base_gex'])
         df['plot_strike'] = np.where(is_spy, df['strike_val'] * 10.0, df['strike_val'])
 
         df['actual_gex'] = np.where(df['type'] == '1', df['scaled_gex'], -df['scaled_gex'])
@@ -667,7 +640,7 @@ class DebugGEXUI:
 def launch_system():
     root = tk.Tk()
     app = DebugGEXUI(root)
-    print("--- Institutional UDP GEX Engine + UI Started ---")
+    print("--- Institutional UDP GEX Engine V3 + UI Started ---")
     root.mainloop()
 
 if __name__ == "__main__":
