@@ -68,11 +68,17 @@ namespace NinjaTrader.NinjaScript.Indicators
         private double lastCalcPrice = 0;
         private DateTime lastCalcTime = DateTime.MinValue;
         
-        // --- NEW: Anchored Basis to prevent visual wiggling ---
+        // --- Anchored Basis to prevent visual wiggling ---
         private double anchoredBasis = 0;
 
         private SharpDX.Direct2D1.SolidColorBrush[] positiveBrushes; 
         private SharpDX.Direct2D1.SolidColorBrush[] negativeBrushes;
+
+        // --- Historical Persistence Variables ---
+        private static readonly object fileLock = new object();
+        private List<GexSnapshot> historicalSnapshots = new List<GexSnapshot>();
+        private bool filesLoaded = false;
+        private int snapshotIndex = 0;
         #endregion
 
         #region Parameters
@@ -103,7 +109,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (State == State.SetDefaults)
             {
-                Description = "TCP GEX Engine V3 (Anchored Heatmap).";
+                Description = "TCP GEX Engine V3 (Anchored Heatmap with Local Persistence).";
                 Name = "GEX Engine V3 (TCP Heatmap)";
                 Calculate = Calculate.OnEachTick;
                 IsOverlay = true;
@@ -120,7 +126,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             else if (State == State.DataLoaded)
             {
-                anchoredBasis = 0; // Reset anchor on load
+                filesLoaded = false;
+                snapshotIndex = 0;
+                anchoredBasis = 0;
+                
+                historicalSnapshots.Clear();
+                gexHistory.Clear(); // Must reset visual history when chart reloads
+
                 positiveBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
                 negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
 
@@ -132,10 +144,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 isListening = false;
                 if (tcpListener != null) tcpListener.Stop();
                 DisposeBrushes();
+                historicalSnapshots.Clear();
             }
         }
 
-        #region TCP Telemetry System
+        #region TCP Telemetry & Persistence System
         private async Task StartTcpServer()
         {
             try 
@@ -151,7 +164,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             catch (Exception ex)
             {
-                Print("TCP Server Error: " + ex.Message);
+                Print(string.Format("TCP Server Error: {0}", ex.Message));
             }
         }
 
@@ -174,8 +187,26 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             try
             {
+                GexSnapshot newSnap = ParseSnapshot(payload);
+                if (newSnap == null) return;
+
+                lock (dataLock) { latestSnapshot = newSnap; }
+                
+                // Asynchronously save to daily file
+                AppendToFile(payload);
+
+                if (ChartControl != null)
+                    ChartControl.Dispatcher.InvokeAsync(() => ChartControl.InvalidateVisual());
+            }
+            catch { }
+        }
+
+        private GexSnapshot ParseSnapshot(string payload)
+        {
+            try
+            {
                 string[] parts = payload.Split('|');
-                if (parts.Length < 2) return;
+                if (parts.Length < 2) return null;
 
                 string[] header = parts[0].Split(',');
                 GexSnapshot newSnap = new GexSnapshot
@@ -203,13 +234,73 @@ namespace NinjaTrader.NinjaScript.Indicators
                         Ticker = row[6]
                     });
                 }
-
-                lock (dataLock) { latestSnapshot = newSnap; }
-                
-                if (ChartControl != null)
-                    ChartControl.Dispatcher.InvokeAsync(() => ChartControl.InvalidateVisual());
+                return newSnap;
             }
-            catch { }
+            catch { return null; }
+        }
+
+        // --- NEW: Safe path creation to target exact Custom/GEXMAP folder ---
+        private string GetGexDirectory()
+        {
+            string dir = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "bin", "Custom", "GEXMAP");
+            if (!Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+            return dir;
+        }
+
+        private void AppendToFile(string payload)
+        {
+            Task.Run(() => 
+            {
+                try 
+                {
+                    string dir = GetGexDirectory();
+                    string filename = Path.Combine(dir, string.Format("GEX_{0:yyyyMMdd}.gex", DateTime.Now));
+                    string cleanPayload = payload.Replace(Environment.NewLine, "").Replace("\r", "").Replace("\n", "");
+                    
+                    lock (fileLock)
+                    {
+                        File.AppendAllText(filename, cleanPayload + Environment.NewLine);
+                    }
+                }
+                catch (Exception ex) { Print(string.Format("GEX File Save Error: {0}", ex.Message)); }
+            });
+        }
+
+        private void LoadHistoricalFiles(DateTime fromDate, DateTime toDate)
+        {
+            historicalSnapshots = new List<GexSnapshot>();
+            string dir = GetGexDirectory();
+
+            Dictionary<double, GexSnapshot> uniqueSnaps = new Dictionary<double, GexSnapshot>();
+
+            for (DateTime d = fromDate.Date; d <= toDate.Date; d = d.AddDays(1))
+            {
+                string filename = string.Format("GEX_{0:yyyyMMdd}.gex", d);
+                string file = Path.Combine(dir, filename);
+                
+                if (File.Exists(file))
+                {
+                    string[] lines = File.ReadAllLines(file);
+                    foreach (string line in lines)
+                    {
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        GexSnapshot snap = ParseSnapshot(line);
+                        if (snap != null)
+                            uniqueSnaps[snap.Timestamp] = snap;
+                    }
+                }
+            }
+            
+            historicalSnapshots = uniqueSnaps.Values.OrderBy(s => s.Timestamp).ToList();
+            Print(string.Format("[NinjaGEX] Loaded {0} historical GEX snapshots from local storage.", historicalSnapshots.Count));
+        }
+
+        private double GetUnixTime(DateTime dt)
+        {
+            return (dt.ToUniversalTime() - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
         }
         #endregion
 
@@ -233,20 +324,57 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnBarUpdate()
         {
-            if (CurrentBars[0] < 0 || latestSnapshot == null) return;
-            
-            double liveEsPrice = Close[0];
-            
-            if (Math.Abs(liveEsPrice - lastCalcPrice) < 0.25 && (DateTime.Now - lastCalcTime).TotalMilliseconds < 250)
-                return;
+            if (CurrentBars[0] < 0) return;
+
+            // --- 1. Load History on first bar execution ---
+            if (!filesLoaded)
+            {
+                // Pad dates by looking back 5 days from the absolute first bar on the chart to grab past files
+                DateTime fromDate = Bars.GetTime(0).AddDays(-5);
+                DateTime toDate = DateTime.Now.AddDays(1);
+                LoadHistoricalFiles(fromDate, toDate);
+                filesLoaded = true;
+            }
+
+            // --- 2. Align Chart Bar Time with Historical Snapshot ---
+            if (State == State.Historical)
+            {
+                double barUnixTime = GetUnixTime(Time[0]);
                 
-            lastCalcPrice = liveEsPrice;
-            lastCalcTime = DateTime.Now;
+                // Advanced robust seek: find the most recent snapshot older than or equal to this bar's time
+                while (snapshotIndex < historicalSnapshots.Count - 1 && 
+                       historicalSnapshots[snapshotIndex + 1].Timestamp <= barUnixTime)
+                {
+                    snapshotIndex++;
+                }
+
+                if (historicalSnapshots.Count > 0 && snapshotIndex < historicalSnapshots.Count)
+                {
+                    if (historicalSnapshots[snapshotIndex].Timestamp <= barUnixTime)
+                    {
+                        lock (dataLock) { latestSnapshot = historicalSnapshots[snapshotIndex]; }
+                    }
+                }
+            }
 
             GexSnapshot snap;
             lock (dataLock) { snap = latestSnapshot; }
 
-            // Lock the visual basis permanently to the very first snapshot received
+            if (snap == null) return;
+            
+            double liveEsPrice = Close[0];
+            
+            // Limit heavy recalculations strictly during Live market ticks
+            if (State == State.Realtime)
+            {
+                if (Math.Abs(liveEsPrice - lastCalcPrice) < 0.25 && (DateTime.Now - lastCalcTime).TotalMilliseconds < 250)
+                    return;
+                    
+                lastCalcTime = DateTime.Now;
+            }
+            lastCalcPrice = liveEsPrice;
+
+            // Lock the visual basis permanently to the very first snapshot evaluated in this session
             if (anchoredBasis == 0 && snap.BasisRatio > 0)
                 anchoredBasis = snap.BasisRatio;
 
@@ -283,6 +411,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             double currentMaxGex = tempNetGex.Values.Select(Math.Abs).DefaultIfEmpty(0.0001).Max();
 
+            // --- 3. Construct or Append Chart Blocks ---
             lock (historyLock)
             {
                 if (gexHistory.Count > 0)
@@ -302,7 +431,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         {
                             StartBar = CurrentBar,
                             EndBar = -1,
-                            BasisRatio = anchoredBasis, // Use anchored basis
+                            BasisRatio = anchoredBasis,
                             Profile = tempNetGex,
                             MaxGex = currentMaxGex
                         });
@@ -314,7 +443,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     {
                         StartBar = CurrentBar,
                         EndBar = -1,
-                        BasisRatio = anchoredBasis, // Use anchored basis
+                        BasisRatio = anchoredBasis,
                         Profile = tempNetGex,
                         MaxGex = currentMaxGex
                     });
